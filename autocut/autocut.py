@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """무음 제거 + 음량 평준화 + 자막 생성 + 캡컷 초안 생성 파이프라인."""
-import argparse, json, re, subprocess, sys
+import argparse, copy, difflib, json, re, subprocess, sys, uuid
 from pathlib import Path
 
 SEC = 1_000_000  # pyJianYingDraft 시간 단위(마이크로초)
@@ -55,6 +55,83 @@ def detect_keep(path, duration, noise_db, min_silence, pad, min_keep):
     return [(a, b) for a, b in merged if b - a >= min_keep]
 
 
+STRICT_FILLERS = {"음", "으음", "어", "어어", "아", "아아", "에", "에이", "흠", "으", "음음", "어음"}
+SOFT_FILLERS = {"그", "저", "뭐", "이제", "막"}  # 실제 단어일 수 있어 길게 끌 때만 추임새로 취급
+RETAKE_MARKERS = ("엔지", "NG", "ng", "다시 갈게", "다시 할게", "다시 하겠", "다시 가겠", "컷")
+
+
+def norm(text):
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", text)
+
+
+def find_fillers(words, extra, soft_min, pad=0.03):
+    strict = STRICT_FILLERS | set(extra)
+    out = []
+    for w in words:
+        t = norm(w.word)
+        dur = w.end - w.start
+        if t in strict or (t in SOFT_FILLERS and dur >= soft_min):
+            out.append({"start": max(0, w.start - pad), "end": w.end + pad,
+                        "reason": "filler", "text": w.word.strip()})
+    return out
+
+
+def split_units(words, gap=0.6):
+    """단어를 문장 단위(말 끊김/문장부호 기준)로 묶는다."""
+    units, cur = [], []
+    for w in words:
+        if cur and (w.start - cur[-1].end > gap or cur[-1].word.strip()[-1:] in ".?!。"):
+            units.append(cur)
+            cur = []
+        cur.append(w)
+    if cur:
+        units.append(cur)
+    return [{"start": u[0].start, "end": u[-1].end,
+             "text": " ".join(w.word.strip() for w in u)} for u in units]
+
+
+def similar(a, b):
+    a, b = norm(a), norm(b)
+    if len(a) < 4 or not b:
+        return 0.0
+    # 앞부분만 말하다 끊고 다시 시작한 경우도 잡도록 b의 앞부분과도 비교
+    full = difflib.SequenceMatcher(None, a, b).ratio()
+    prefix = difflib.SequenceMatcher(None, a, b[:len(a) + 2]).ratio()
+    return max(full, prefix)
+
+
+def find_retakes(words, threshold, window=3, pad=0.05):
+    """같은 문장을 반복해서 다시 말한 경우, 앞선 시도(NG)를 지우고 마지막 테이크만 남긴다."""
+    units = split_units(words)
+    drop = set()
+    for i, u in enumerate(units):
+        if any(m in u["text"] for m in RETAKE_MARKERS) and len(norm(u["text"])) <= 12:
+            drop.add((i, "retake-marker"))  # "다시 갈게요" 같은 진행 멘트
+            continue
+        for j in range(i + 1, min(i + 1 + window, len(units))):
+            if similar(u["text"], units[j]["text"]) >= threshold:
+                drop.update((k, "retake") for k in range(i, j))
+                break
+    return [{"start": max(0, units[k]["start"] - pad), "end": units[k]["end"] + pad,
+             "reason": r, "text": units[k]["text"]} for k, r in sorted(drop)]
+
+
+def subtract(keep, removed):
+    """keep 구간에서 removed 구간들을 빼고 남은 구간을 반환."""
+    for r in sorted(removed, key=lambda x: x["start"]):
+        nxt = []
+        for a, b in keep:
+            if r["end"] <= a or r["start"] >= b:
+                nxt.append((a, b))
+                continue
+            if r["start"] > a:
+                nxt.append((a, r["start"]))
+            if r["end"] < b:
+                nxt.append((r["end"], b))
+        keep = nxt
+    return keep
+
+
 def to_new_time(t, keep):
     """원본 시간 t → 컷 편집 후 타임라인 시간 (컷된 구간이면 None)."""
     acc = 0.0
@@ -68,8 +145,11 @@ def to_new_time(t, keep):
 def transcribe(path, model_name, language):
     from faster_whisper import WhisperModel
     model = WhisperModel(model_name, compute_type="auto")
-    segs, _ = model.transcribe(str(path), language=language, word_timestamps=True,
-                               vad_filter=True)
+    # initial_prompt: 추임새를 생략하지 않고 받아적도록 유도 (제거 대상 탐지용)
+    segs, _ = model.transcribe(
+        str(path), language=language, word_timestamps=True, vad_filter=True,
+        vad_parameters={"threshold": 0.3, "min_silence_duration_ms": 500},
+        initial_prompt="음... 어... 그, 그러니까, 저기... 네, 안녕하세요. 어, 음, 오늘은요.")
     return [w for s in segs for w in s.words]
 
 
@@ -120,7 +200,57 @@ def render_preview(src, keep, dst):
          f"{v}{j}concat=n={len(keep)}:v=1:a=1[v][a]", "-map", "[v]", "-map", "[a]", str(dst)])
 
 
-def make_draft(draft_dir, name, media, keep, lines, size, fps, text_size):
+def apply_style_template(draft_path, template_path):
+    """템플릿 초안(캡컷에서 '기본텍스트'를 올려둔 초안)의 텍스트 서식을 자막 전체에 복제한다."""
+    tpl = json.loads(Path(template_path, "draft_content.json").read_text(encoding="utf-8"))
+    tmats = {m["id"]: m for m in tpl["materials"].get("texts", [])}
+    tseg = next((sg for t in tpl["tracks"] if t["type"] == "text" for sg in t["segments"]
+                 if sg["material_id"] in tmats), None)
+    if tseg is None:
+        sys.exit(f"템플릿 초안에 텍스트가 없습니다: {template_path}")
+    tmat = tmats[tseg["material_id"]]
+    tcontent = json.loads(tmat["content"]) if isinstance(tmat.get("content"), str) else None
+
+    f = Path(draft_path, "draft_content.json")
+    d = json.loads(f.read_text(encoding="utf-8"))
+    mats = d["materials"]
+    all_tpl = {m["id"]: (k, m) for k, v in tpl["materials"].items() if isinstance(v, list)
+               for m in v if isinstance(m, dict) and "id" in m}
+    for track in d["tracks"]:
+        if track["type"] != "text":
+            continue
+        for seg in track["segments"]:
+            old = next(m for m in mats["texts"] if m["id"] == seg["material_id"])
+            new = copy.deepcopy(tmat)
+            new["id"] = uuid.uuid4().hex.upper()
+            text = json.loads(old["content"])["text"] if isinstance(old.get("content"), str) else old["content"]
+            if tcontent is not None:
+                c = copy.deepcopy(tcontent)
+                c["text"] = text
+                for st in c.get("styles", []):
+                    st["range"] = [0, len(text)]
+                new["content"] = json.dumps(c, ensure_ascii=False)
+            else:
+                new["content"] = text
+            for key in ("words", "base_content"):
+                if key in new:
+                    new[key] = type(new[key])()
+            mats["texts"] = [m for m in mats["texts"] if m["id"] != old["id"]] + [new]
+            seg["material_id"] = new["id"]
+            seg["clip"] = copy.deepcopy(tseg.get("clip", seg.get("clip")))
+            refs = []  # 애니메이션·효과 등 부속 소재도 새 id로 복제
+            for rid in tseg.get("extra_material_refs", []):
+                if rid in all_tpl:
+                    k, m = all_tpl[rid]
+                    m = copy.deepcopy(m)
+                    m["id"] = uuid.uuid4().hex.upper()
+                    mats.setdefault(k, []).append(m)
+                    refs.append(m["id"])
+            seg["extra_material_refs"] = refs
+    f.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+
+
+def make_draft(draft_dir, name, media, keep, lines, size, fps, text_size, style_draft=None):
     import pyJianYingDraft as jy
     from pyJianYingDraft import Timerange, TrackType
     script = jy.DraftFolder(str(draft_dir)).create_draft(
@@ -145,6 +275,8 @@ def make_draft(draft_dir, name, media, keep, lines, size, fps, text_size):
             l["text"], Timerange(int(l["start"] * SEC), int((l["end"] - l["start"]) * SEC)),
             style=style, clip_settings=clip, border=border), ttrack)
     script.save()
+    if style_draft and lines:
+        apply_style_template(Path(draft_dir, name), Path(draft_dir, style_draft))
 
 
 def main():
@@ -162,6 +294,13 @@ def main():
     ap.add_argument("--lang", default="ko")
     ap.add_argument("--max-chars", type=int, default=18, help="자막 한 줄 최대 글자수")
     ap.add_argument("--text-size", type=float, default=8.0)
+    ap.add_argument("--no-clean", action="store_true", help="더듬는 말/NG 자동삭제 끄기")
+    ap.add_argument("--no-filler", action="store_true", help="추임새 삭제만 끄기")
+    ap.add_argument("--no-ng", action="store_true", help="NG(재촬영) 삭제만 끄기")
+    ap.add_argument("--filler-words", default="", help="추가 추임새, 쉼표 구분 (예: 그니까,뭐지)")
+    ap.add_argument("--soft-filler-min", type=float, default=0.4, help="'그/저/뭐'를 추임새로 볼 최소 길이(초)")
+    ap.add_argument("--retake-threshold", type=float, default=0.7, help="NG 판정 유사도(0~1, 낮을수록 공격적)")
+    ap.add_argument("--style-draft", help="'기본텍스트'가 올려진 캡컷 초안 이름 (자막 서식 템플릿)")
     ap.add_argument("--render", action="store_true", help="컷 편집 미리보기 mp4도 생성")
     ap.add_argument("--draft-dir", help="캡컷 초안 폴더 (예: .../CapCut Drafts)")
     a = ap.parse_args()
@@ -181,19 +320,35 @@ def main():
     (out / "cuts.json").write_text(json.dumps(
         [{"start": s, "end": e} for s, e in keep], indent=2))
 
-    lines = []
-    if not a.no_subs:
+    lines, removed = [], []
+    need_words = not a.no_subs or not a.no_clean
+    if need_words:
         print("[3/4] 음성 인식(Whisper)")
-        lines = build_subtitles(transcribe(media, a.model, a.lang), keep, a.max_chars, 0.7)
-        write_srt(lines, out / f"{src.stem}.srt")
-        print(f"      자막 {len(lines)}줄")
+        words = transcribe(media, a.model, a.lang)
+        if not a.no_clean:
+            if not a.no_filler:
+                removed += find_fillers(words, [x for x in a.filler_words.split(",") if x],
+                                        a.soft_filler_min)
+            if not a.no_ng:
+                removed += find_retakes(words, a.retake_threshold)
+            keep = [(x, y) for x, y in subtract(keep, removed) if y - x >= a.min_keep]
+            (out / "removed.json").write_text(
+                json.dumps(removed, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"      추임새/NG {len(removed)}건 삭제 (확인: removed.json), "
+                  f"최종 {sum(y - x for x, y in keep):.1f}s")
+            (out / "cuts.json").write_text(json.dumps(
+                [{"start": x, "end": y} for x, y in keep], indent=2))
+        if not a.no_subs:
+            lines = build_subtitles(words, keep, a.max_chars, 0.7)
+            write_srt(lines, out / f"{src.stem}.srt")
+            print(f"      자막 {len(lines)}줄")
 
     print("[4/4] 결과물 생성")
     if a.render:
         render_preview(media, keep, out / f"{src.stem}_cut.mp4")
     if a.draft_dir:
         make_draft(a.draft_dir, f"autocut_{src.stem}", media, keep, lines,
-                   (w, h), fps, a.text_size)
+                   (w, h), fps, a.text_size, a.style_draft)
         print(f"      캡컷 초안 생성: autocut_{src.stem}")
     print(f"완료 → {out}")
 
