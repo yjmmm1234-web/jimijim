@@ -29,7 +29,7 @@ def normalize(src, dst, target_lufs):
          f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11", "-c:a", "aac", "-b:a", "192k", str(dst)])
 
 
-def detect_keep(path, duration, noise_db, min_silence, pad, min_keep):
+def detect_keep(path, duration, noise_db, min_silence, lead, trail, min_keep):
     """silencedetect로 무음 구간을 찾고, 남길 구간(앞뒤 pad 포함) 목록을 반환."""
     err = run(["ffmpeg", "-i", str(path), "-af",
                f"silencedetect=noise={noise_db}dB:d={min_silence}", "-f", "null", "-"],
@@ -45,7 +45,7 @@ def detect_keep(path, duration, noise_db, min_silence, pad, min_keep):
         cur = e
     if cur < duration:
         keep.append([cur, duration])
-    keep = [[max(0, a - pad), min(duration, b + pad)] for a, b in keep]
+    keep = [[max(0, a - lead), min(duration, b + trail)] for a, b in keep]
     merged = []
     for a, b in keep:  # pad로 겹친 구간 병합
         if merged and a <= merged[-1][1]:
@@ -62,6 +62,25 @@ RETAKE_MARKERS = ("엔지", "NG", "ng", "다시 갈게", "다시 할게", "다�
 
 def norm(text):
     return re.sub(r"[^0-9A-Za-z가-힣]", "", text)
+
+
+def snap_to_words(keep, words, lead, trail):
+    """컷 경계가 단어 한가운데에 걸리면 그 단어가 통째로 들어오도록 구간을 넓힌다."""
+    out = []
+    for a, b in keep:
+        for w in words:
+            if w.start < a < w.end:
+                a = max(0, w.start - lead)
+            if w.start < b < w.end:
+                b = w.end + trail
+        out.append([a, b])
+    merged = []
+    for a, b in out:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
 
 
 def find_fillers(words, extra, soft_min, pad=0.03):
@@ -314,7 +333,7 @@ def main():
     w, h, fps, dur = probe(media)
 
     print("[2/4] 무음 구간 탐지")
-    keep = detect_keep(media, dur, a.noise, a.min_silence, a.pad, a.min_keep)
+    keep = detect_keep(media, dur, a.noise, a.min_silence, a.lead, a.pad, a.min_keep)
     kept = sum(b - a_ for a_, b in keep)
     print(f"      {dur:.1f}s → {kept:.1f}s ({len(keep)}개 컷, {dur - kept:.1f}s 삭제)")
     (out / "cuts.json").write_text(json.dumps(
@@ -325,6 +344,7 @@ def main():
     if need_words:
         print("[3/4] 음성 인식(Whisper)")
         words = transcribe(media, a.model, a.lang)
+        keep = snap_to_words(keep, words, a.lead, a.pad)
         if not a.no_clean:
             if not a.no_filler:
                 removed += find_fillers(words, [x for x in a.filler_words.split(",") if x],
